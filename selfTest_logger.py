@@ -21,13 +21,13 @@ def load_db_config(config_file_path='dataBaseInfo.config'):
         config_namespace = {}
         exec(config_content, config_namespace)
         
-        return config_namespace['db_config']
+        return config_namespace['db_config_lenovo']  # Changed to use lenovo config
     
     except FileNotFoundError:
         logger.error(f"Config file not found: {config_path}")
         raise
     except KeyError:
-        logger.error(f"db_config not found in config file: {config_path}")
+        logger.error(f"db_config_lenovo not found in config file: {config_path}")
         raise
     except Exception as e:
         logger.error(f"Error loading config file: {e}")
@@ -53,41 +53,75 @@ class DiagnosticLogParser:
             self.conn.close()
             logger.info("Database connection closed")
     
-    #parses the log file to be able to read and extract the information
+    #parses the JSON file to be able to read and extract the information
     #and returns a dictionary with the parsed data
-    def parse_log_file(self, log_file_path):
-        with open(log_file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-        
-        data = {}
-        
-        #System information
-        data['serial_number'] = self._extract_field(content, r'SERIAL_NUMBER:\s*(.+)')
-        data['bios_version'] = self._extract_field(content, r'BIOS_VERSION:\s*(.+)')
-        data['machine_model'] = self._extract_field(content, r'MACHINE_MODEL:\s*(.+)')
-        data['app_version'] = self._extract_field(content, r'APPLICATION_VERSION:\s*(.+)')
-        data['execution_type'] = self._extract_field(content, r'EXECUTION_TYPE:\s*(.+)')
-        
-        #Time for time started
-        data['execution_start'] = self._extract_execution_time(content)
-        
-        #Computer components
-        data['battery'] = self._parse_battery(content)
-        data['display'] = self._parse_display(content)
-        data['cpu'] = self._parse_cpu(content)
-        data['memory'] = self._parse_memory(content)
-        data['storage'] = self._parse_storage(content)
-        data['motherboard'] = self._parse_motherboard(content)
-        
-        #Test results
-        data['test_results'] = self._parse_test_results(content)
-        data['test_summary'] = self._parse_test_summary(content)
-        
-        return data
+    def parse_json_file(self, json_file_path):
+        try:
+            with open(json_file_path, 'r', encoding='utf-8') as file:
+                json_data = json.load(file)
+            
+            data = {}
+            
+            #System information
+            data['serial_number'] = json_data.get('machine_serial_number')
+            data['bios_version'] = json_data.get('bios_version')
+            data['machine_model'] = json_data.get('machine_model')
+            data['machine_type_model'] = json_data.get('machine_type_model')  # For motherboard specs
+            data['app_version'] = json_data.get('application_version')
+            data['execution_type'] = json_data.get('execution_type')
+            
+            #Time for time started (convert from the JSON format)
+            data['execution_start'] = self._parse_json_timestamp(json_data.get('start_time'))
+            
+            #Computer components - extract from iterations[0].modules
+            if json_data.get('iterations') and len(json_data['iterations']) > 0:
+                modules = json_data['iterations'][0].get('modules', [])
+                data['battery'] = self._parse_json_battery(modules)
+                data['display'] = self._parse_json_display(modules)
+                data['cpu'] = self._parse_json_cpu(modules)
+                data['memory'] = self._parse_json_memory(modules)
+                data['storage'] = self._parse_json_storage(modules)
+                data['motherboard'] = self._parse_json_motherboard(modules)
+                
+                #Test results from all modules
+                data['test_results'] = self._parse_json_test_results(modules)
+                data['test_summary'] = self._parse_json_test_summary(json_data['iterations'][0])
+            else:
+                # Initialize empty if no iterations
+                data['battery'] = None
+                data['display'] = None
+                data['cpu'] = None
+                data['memory'] = []
+                data['storage'] = None
+                data['motherboard'] = None
+                data['test_results'] = []
+                data['test_summary'] = None
+            
+            return data
+            
+        except FileNotFoundError:
+            logger.error(f"JSON file not found: {json_file_path}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON file {json_file_path}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing JSON file {json_file_path}: {e}")
+            raise
     
     def _extract_field(self, content, pattern):
         match = re.search(pattern, content)
         return match.group(1).strip() if match else None
+    
+    #Parse JSON timestamp format (e.g., "20250729T105545")
+    def _parse_json_timestamp(self, timestamp_str):
+        if not timestamp_str:
+            return None
+        try:
+            return datetime.strptime(timestamp_str, '%Y%m%dT%H%M%S')
+        except ValueError:
+            logger.warning(f"Could not parse timestamp: {timestamp_str}")
+            return None
     
     #Execution time
     def _extract_execution_time(self, content):
@@ -301,7 +335,7 @@ class DiagnosticLogParser:
         match = re.search(pattern, text)
         return int(match.group(1)) if match else None
     
-    #validates the battery health and cycle count based on Lenovo standards
+    #validates the battery health and cycle count based on Lenovo standards (original method)
     def _validate_battery(self, health_percentage, cycles):
         status = "PASSED"
         messages = []
@@ -333,8 +367,277 @@ class DiagnosticLogParser:
             'message': '; '.join(messages)
         }
     
-    #uploads the information to the database
-    #and returns the log_test_id of the uploaded data
+    #validates the battery health and cycle count based on updated Lenovo standards (from process_real_data.py)
+    def _validate_battery_new(self, health_percentage, cycles):
+        """Validate battery based on Lenovo standards"""
+        if health_percentage is None or cycles is None:
+            return {'status': 'UNKNOWN', 'message': 'Insufficient data for validation'}
+        
+        if health_percentage >= 80 and cycles <= 500:
+            return {'status': 'GOOD', 'message': 'Battery health is within acceptable range'}
+        elif health_percentage >= 70 and cycles <= 800:
+            return {'status': 'FAIR', 'message': 'Battery health is fair, consider replacement soon'}
+        else:
+            return {'status': 'POOR', 'message': 'Battery health is poor, replacement recommended'}
+    
+    # JSON-specific parsing methods (updated from process_real_data.py)
+    def _parse_json_battery(self, modules):
+        """Parse battery information from JSON modules"""
+        for module in modules:
+            if module.get('name') == 'BATTERY':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    details = diag.get('properties', {})
+                    
+                    # Get battery metrics
+                    design_capacity = details.get('DESIGN_CAPACITY')
+                    full_charge_capacity = details.get('FULL_CHARGE_CAPACITY')
+                    cycles = details.get('CYCLE_COUNT')
+                    
+                    # Extract numeric part from values like '57000mWh (3691mAh)'
+                    def extract_num(val):
+                        if not val:
+                            return 0
+                        m = re.match(r'(\d+)', str(val))
+                        return int(m.group(1)) if m else 0
+                    
+                    design_capacity_num = extract_num(design_capacity)
+                    full_charge_capacity_num = extract_num(full_charge_capacity)
+                    cycles_num = extract_num(cycles)
+                    
+                    # Calculate health percentage
+                    health_percentage = None
+                    if design_capacity_num > 0 and full_charge_capacity_num > 0:
+                        health_percentage = (full_charge_capacity_num / design_capacity_num) * 100
+                    
+                    # Validate battery using updated validation logic
+                    validation = self._validate_battery_new(health_percentage, cycles_num)
+                    
+                    return {
+                        'serial_number': details.get('SERIAL_NUMBER'),
+                        'manufacturer': details.get('MANUFACTURER'),
+                        'design_capacity': design_capacity_num,
+                        'full_charge_capacity': full_charge_capacity_num,
+                        'cycles': cycles_num,
+                        'health_percentage': health_percentage,
+                        'validation_status': validation['status'],
+                        'validation_message': validation['message']
+                    }
+        return None
+    
+    def _parse_json_display(self, modules):
+        """Parse display information from JSON modules"""
+        for module in modules:
+            if module.get('name') == 'DISPLAY':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    properties = diag.get('properties', {})
+                    
+                    # Parse resolution
+                    native_res = properties.get('NATIVE_RESOLUTION', '0x0')
+                    width, height = 0, 0
+                    if 'x' in native_res:
+                        try:
+                            width, height = map(int, native_res.split('x'))
+                        except ValueError:
+                            pass
+                    
+                    return {
+                        'name': diag.get('udi', '').split(' - ')[-1] if diag.get('udi') else None,
+                        'serial_number': diag.get('udi'),
+                        'manufacturer_id': properties.get('MANUFACTURER_ID'),
+                        'manufacturer_code': properties.get('MANUFACTURER_ID'),
+                        'width': width,
+                        'height': height,
+                        'max_nits': 300.0,
+                        'min_nits': 0.5
+                    }
+        return None
+    
+    def _parse_json_cpu(self, modules):
+        """Parse CPU information from JSON modules"""
+        for module in modules:
+            if module.get('name') == 'CPU':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    properties = diag.get('properties', {})
+                    
+                    return {
+                        'model': properties.get('CPU_MODEL'),
+                        'vendor': properties.get('CPU_VENDOR'),
+                        'cores': int(properties.get('CPU_CORES', 0)) if properties.get('CPU_CORES') else None,
+                        'threads': int(properties.get('CPU_THREADS', 0)) if properties.get('CPU_THREADS') else None,
+                        'max_speed': properties.get('CPU_CURRENT_SPEED'),
+                        'features': properties.get('CPU_FEATURES')
+                    }
+        return None
+    
+    def _parse_json_memory(self, modules):
+        """Parse memory information from JSON modules (updated from process_real_data.py)"""
+        for module in modules:
+            if module.get('name') == 'MEMORY':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    details = diag.get('properties', {})
+                    resources = diag.get('resources', [])
+                    
+                    # Count memory modules and get sample info from first module
+                    memory_modules = [res for res in resources if res.get('name') == 'bank']
+                    module_count = len(memory_modules)
+                    
+                    # Get details from first module as representative sample
+                    sample_module = memory_modules[0] if memory_modules else {}
+                    
+                    # Calculate total memory from individual modules
+                    total_memory_gb = 0
+                    module_size_str = sample_module.get('SIZE', '0 GB')
+                    if module_size_str:
+                        # Extract numeric part from '4.000 GB'
+                        size_match = re.match(r'([\d.]+)', module_size_str)
+                        if size_match:
+                            module_size_gb = float(size_match.group(1))
+                            total_memory_gb = module_size_gb * module_count
+                    
+                    # Return single memory entry with summary
+                    return [{
+                        'manufacturer': sample_module.get('MANUFACTURER', 'Unknown'),
+                        'part_number': sample_module.get('PART_NUMBER', 'Unknown'),
+                        'serial_number': f'Module_Count_{module_count}',
+                        'capacity': int(total_memory_gb * 1024) if total_memory_gb > 0 else 0,  # Convert to MB
+                        'device_locator': f'TOTAL_{module_count}_MODULES',
+                        'bank_locator': f'{sample_module.get("TYPE", "Unknown")}_MEMORY'
+                    }]
+        return []
+    
+    def _parse_json_storage(self, modules):
+        """Parse storage information from JSON modules (updated from process_real_data.py)"""
+        for module in modules:
+            if module.get('name') == 'STORAGE':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    details = diag.get('properties', {})
+                    
+                    return {
+                        'model': details.get('MODEL'),
+                        'manufacturer': details.get('MODEL', '').split(' ')[0] if details.get('MODEL') else None,
+                        'serial_number': details.get('SERIAL'),
+                        'device_type': details.get('PROTOCOL', 'Unknown'),
+                        'size': details.get('SIZE'),
+                        'firmware_revision': details.get('FIRMWARE'),
+                        'temperature': details.get('TEMPERATURE')
+                    }
+        return None
+    
+    def _parse_json_motherboard(self, modules):
+        """Parse motherboard information from JSON modules"""
+        for module in modules:
+            if module.get('name') == 'MOTHERBOARD':
+                diagnostics = module.get('diagnostics', [])
+                if diagnostics:
+                    diag = diagnostics[0]
+                    properties = diag.get('properties', {})
+                    
+                    return {
+                        '8s_code': None,  # Not available in JSON format
+                        'tb_fw_version': None,  # Not available in JSON format
+                        'usb_controllers': int(properties.get('MOTHERBOARD_USB_HOST_CONTROLLER_COUNT', 0)) if properties.get('MOTHERBOARD_USB_HOST_CONTROLLER_COUNT') else None,
+                        'pci_devices': int(properties.get('MOTHERBOARD_PCI_DEVICE_COUNT', 0)) if properties.get('MOTHERBOARD_PCI_DEVICE_COUNT') else None,
+                        'rtc_presence': properties.get('MOTHERBOARD_RTC_PRESENT')
+                    }
+        return None
+    
+    def _parse_json_test_results(self, modules):
+        """Parse individual test results from JSON modules"""
+        test_results = []
+        
+        for module in modules:
+            module_name = module.get('name', '')
+            diagnostics = module.get('diagnostics', [])
+            
+            for diag in diagnostics:
+                tests = diag.get('tests', [])
+                
+                for test in tests:
+                    start_time = self._parse_json_timestamp(test.get('start_time'))
+                    finish_time = self._parse_json_timestamp(test.get('finish_time'))
+                    
+                    test_result = {
+                        'component': module_name,
+                        'test_name': test.get('name'),
+                        'start_time': start_time,
+                        'end_time': finish_time,
+                        'duration': int(test.get('duration', 0)) if test.get('duration') else 0,
+                        'status': 'PASSED' if test.get('result') == 'SUCCESS' else 'FAILED'
+                    }
+                    test_results.append(test_result)
+        
+        return test_results
+    
+    def _parse_json_test_summary(self, iteration):
+        """Parse test summary from JSON iteration"""
+        overall_status = iteration.get('overall_status')
+        
+        # Count tests from all modules
+        total_tests = 0
+        passed_tests = 0
+        failed_tests = 0
+        
+        modules = iteration.get('modules', [])
+        for module in modules:
+            diagnostics = module.get('diagnostics', [])
+            for diag in diagnostics:
+                tests = diag.get('tests', [])
+                for test in tests:
+                    total_tests += 1
+                    if test.get('result') == 'SUCCESS':
+                        passed_tests += 1
+                    else:
+                        failed_tests += 1
+        
+        # Calculate elapsed time
+        start_time = self._parse_json_timestamp(iteration.get('start_time'))
+        finish_time = self._parse_json_timestamp(iteration.get('finish_time'))
+        elapsed_time = None
+        if start_time and finish_time:
+            elapsed_seconds = (finish_time - start_time).total_seconds()
+            elapsed_time = f"{int(elapsed_seconds)} S"
+        
+        return {
+            'total_tests': total_tests,
+            'passed_tests': passed_tests,
+            'failed_tests': failed_tests,
+            'warning_tests': 0,  # Not tracked in JSON format
+            'canceled_tests': 0,  # Not tracked in JSON format
+            'not_applicable_tests': 0,  # Not tracked in JSON format
+            'elapsed_time': elapsed_time,
+            'final_result_code': iteration.get('final_result_code')
+        }
+    
+    def _extract_capacity_value(self, capacity_str):
+        """Extract numeric capacity value from strings like '50270mWh (3059mAh)'"""
+        if not capacity_str:
+            return None
+        
+        # Extract the first numeric value (mWh)
+        import re
+        match = re.search(r'(\d+)mWh', capacity_str)
+        if match:
+            return int(match.group(1))
+        
+        # Fallback to any numeric value
+        match = re.search(r'(\d+)', capacity_str)
+        if match:
+            return int(match.group(1))
+        
+        return None
+    
+    #uploads the information to the new Lenovo diagnostics database
+    #and returns the system_id of the uploaded data
     def upload_to_database(self, data, employee_number=None):
         if not self.conn:
             raise Exception("Database connection not established")
@@ -342,172 +645,176 @@ class DiagnosticLogParser:
         cursor = self.conn.cursor()
         
         try:
-            # 1. Insert/Update device
-            device_id = data['serial_number']
-            machine_model = data['machine_model']
-            
+            # 1. Insert/Update system_info (main table)
             cursor.execute("""
-                INSERT INTO mb_api_device ("idSerial", "partNo") 
-                VALUES (%s, %s) 
-                ON CONFLICT ("idSerial") DO UPDATE SET "partNo" = EXCLUDED."partNo"
-            """, (device_id, machine_model))
-            
-            # 2. Insert/Update motherboard
-            cursor.execute("""
-                INSERT INTO mb_api_motherboard (serial_number, bios_version, manufacturer, "original_productKey", product_id, "SKU")
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (serial_number) DO UPDATE SET
+                INSERT INTO system_info (serial_number, machine_model, machine_type_model, bios_version, app_version, execution_type, start_time, finish_time) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+                ON CONFLICT (serial_number) DO UPDATE SET 
+                    machine_model = EXCLUDED.machine_model,
+                    machine_type_model = EXCLUDED.machine_type_model,
                     bios_version = EXCLUDED.bios_version,
-                    manufacturer = EXCLUDED.manufacturer
+                    app_version = EXCLUDED.app_version,
+                    execution_type = EXCLUDED.execution_type,
+                    start_time = EXCLUDED.start_time,
+                    finish_time = EXCLUDED.finish_time,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id
             """, (
                 data['serial_number'],
+                data['machine_model'],
+                data['machine_type_model'],
                 data['bios_version'],
-                'Lenovo',
-                '',
-                machine_model,
-                ''
-            ))
-            
-            # 3. Insert battery if available
-            battery_id = None
-            if data['battery']:
-                cursor.execute("""
-                    INSERT INTO mb_api_battery (serial_number, manufacture_name, desing_capacity, full_charge_capacity, device_name, cycles)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
-                    data['battery']['serial_number'],
-                    data['battery']['manufacturer'],
-                    data['battery']['design_capacity'] or 0,
-                    data['battery']['full_charge_capacity'] or 0,
-                    data['battery']['device_name'],
-                    data['battery']['cycles']
-                ))
-                battery_id = cursor.fetchone()[0]
-                
-                #Battery results
-                battery_status = data['battery']['validation_status']
-                battery_message = data['battery']['validation_message']
-                logger.info(f"Battery validation - Serial: {data['battery']['serial_number']}, "
-                           f"Status: {battery_status}, Health: {data['battery'].get('health_percentage', 'N/A')}%, "
-                           f"Cycles: {data['battery'].get('cycles_numeric', 'N/A')}, Message: {battery_message}")
-                
-                if battery_status == "FAILED":
-                    battery_test_result = {
-                        'test_name': 'BATTERY_VALIDATION',
-                        'start_time': data['execution_start'] or datetime.now(),
-                        'end_time': data['execution_start'] or datetime.now(),
-                        'result': 'FAILED',
-                        'duration': 0,
-                        'detail_message': battery_message
-                    }
-                    if data['test_results'] is None:
-                        data['test_results'] = []
-                    data['test_results'].append(battery_test_result)
-            
-            # 4. Insert monitor if available
-            monitor_id = None
-            if data['display']:
-                cursor.execute("""
-                    INSERT INTO mb_api_monitor (name, serial_number, max_nits, min_nits, width, height, manufacturer_id, manufacturer_code)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
-                    data['display']['name'],
-                    data['display']['serial_number'],
-                    data['display']['max_nits'],
-                    data['display']['min_nits'],
-                    data['display']['width'],
-                    data['display']['height'],
-                    data['display']['manufacturer_id'],
-                    data['display']['manufacturer_code']
-                ))
-                monitor_id = cursor.fetchone()[0]
-            
-            # 5. Insert main test log
-            # Check if battery validation failed to update overall test status
-            battery_failed = False
-            if data['battery'] and data['battery']['validation_status'] == 'FAILED':
-                battery_failed = True
-            
-            # Determine overall test status
-            summary_failed = data['test_summary']['failed_tests'] > 0 if data['test_summary'] else False
-            all_tests_passed = not (summary_failed or battery_failed)
-            
-            cursor.execute("""
-                INSERT INTO mb_api_logtest (
-                    all_tests_passed, test_date, numero_de_empleado, motherboard_id, 
-                    mb_type_test, report, when_started, app_ver, monitor_id, battery_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING log_id
-            """, (
-                all_tests_passed,
-                data['execution_start'] or datetime.now(),
-                employee_number,
-                data['serial_number'],
-                data['execution_type'],
-                json.dumps(data['test_summary']) if data['test_summary'] else '{}',
-                data['execution_start'],
                 data['app_version'],
-                monitor_id,
-                battery_id
+                data['execution_type'],
+                data.get('start_time'),
+                data.get('finish_time')
             ))
             
-            log_test_id = cursor.fetchone()[0]
+            system_id = cursor.fetchone()[0]
             
-            # 6. Insert individual test results
-            if data['test_results']:
-                for test in data['test_results']:
-                    test_passed = test['result'] == 'PASSED'
-                    # Use custom detail message if available, otherwise use duration
-                    detail_message = test.get('detail_message', f"Duration: {test['duration']}s")
-                    cursor.execute("""
-                        INSERT INTO mb_api_individualtestresult (test_name, test_passed, detail_message, test_result_id)
-                        VALUES (%s, %s, %s, %s)
-                    """, (
-                        test['test_name'],
-                        test_passed,
-                        detail_message,
-                        log_test_id
-                    ))
+            # 2. Insert battery if available
+            if data['battery']:
+                battery = data['battery']
+                # Delete existing battery record for this system first
+                cursor.execute("DELETE FROM battery WHERE system_id = %s", (system_id,))
+                
+                cursor.execute("""
+                    INSERT INTO battery (system_id, serial_number, manufacturer, design_capacity, full_charge_capacity, cycles, health_percentage, validation_status, validation_message)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    system_id,
+                    battery['serial_number'],
+                    battery['manufacturer'],
+                    f"{battery['design_capacity']} mWh" if battery['design_capacity'] else None,
+                    f"{battery['full_charge_capacity']} mWh" if battery['full_charge_capacity'] else None,
+                    battery['cycles'],
+                    f"{battery['health_percentage']:.2f}%" if battery['health_percentage'] else None,
+                    battery['validation_status'],
+                    battery['validation_message']
+                ))
+                
+                logger.info(f"Battery validation - Serial: {battery['serial_number']}, "
+                           f"Status: {battery['validation_status']}, Health: {battery.get('health_percentage', 'N/A')}%, "
+                           f"Cycles: {battery.get('cycles', 'N/A')}, Message: {battery['validation_message']}")
             
-            # 7. Insert memory modules
+            # 3. Insert display if available
+            if data['display']:
+                display = data['display']
+                # Delete existing display record for this system first
+                cursor.execute("DELETE FROM display WHERE system_id = %s", (system_id,))
+                
+                cursor.execute("""
+                    INSERT INTO display (system_id, name, manufacturer_id, width, height, edid_version)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    system_id,
+                    display.get('name'),
+                    display.get('manufacturer_id'),
+                    display.get('width'),
+                    display.get('height'),
+                    display.get('edid_version')
+                ))
+            
+            # 4. Insert CPU if available
+            if data['cpu']:
+                cpu = data['cpu']
+                # Delete existing CPU record for this system first
+                cursor.execute("DELETE FROM cpu WHERE system_id = %s", (system_id,))
+                
+                cursor.execute("""
+                    INSERT INTO cpu (system_id, model, manufacturer, cores, threads, current_speed, cache_l1, cache_l2, cache_l3)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    system_id,
+                    cpu.get('model'),
+                    cpu.get('manufacturer'),  # Use manufacturer instead of vendor
+                    cpu.get('cores'),
+                    cpu.get('threads'),
+                    cpu.get('current_speed'),  # Use current_speed instead of max_speed
+                    cpu.get('cache_l1'),  # Use actual cache_l1 instead of features
+                    cpu.get('cache_l2'),  # Use actual cache_l2
+                    cpu.get('cache_l3')   # Use actual cache_l3
+                ))
+            
+            # 5. Insert memory (single entry with module count)
             if data['memory']:
+                # Delete existing memory records for this system first
+                cursor.execute("DELETE FROM memory WHERE system_id = %s", (system_id,))
+                
                 for memory in data['memory']:
                     if memory['capacity']:
                         cursor.execute("""
-                            INSERT INTO mb_api_ram (manufacturer, part_number, serial_number, capacity, log_test_id)
-                            VALUES (%s, %s, %s, %s, %s)
+                            INSERT INTO memory (system_id, total_memory, module_count, module_type, module_manufacturer, module_size, module_speed, module_part_number)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
+                            system_id,
+                            f"{memory['capacity'] / 1024:.0f} GB",  # Convert MB to GB
+                            1,  # Placeholder for module count
+                            memory['bank_locator'],
                             memory['manufacturer'],
-                            memory['part_number'],
-                            memory['serial_number'] or 'Unknown',
-                            memory['capacity'],
-                            log_test_id
+                            f"{memory['capacity']} MB",
+                            'Unknown',  # Speed not available in current format
+                            memory['part_number']
                         ))
+                        break  # Only insert first entry since we're using summary format
             
-            # 8. Insert storage/disk information
+            # 6. Insert storage if available
             if data['storage']:
-                partitions_info = json.dumps({
-                    "size": data['storage']['size'],
-                    "type": data['storage']['device_type']
-                })
+                # Delete existing storage records for this system first
+                cursor.execute("DELETE FROM storage WHERE system_id = %s", (system_id,))
                 
+                storage = data['storage']
                 cursor.execute("""
-                    INSERT INTO mb_api_disk (model, size, serial_number, log_test_id, partitions_info, unallocated)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO storage (system_id, model, serial_number, size, protocol, firmware, temperature)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (
-                    data['storage']['model'],
-                    data['storage']['size'],
-                    data['storage']['serial_number'],
-                    log_test_id,
-                    partitions_info,
-                    '0 GB'
+                    system_id,
+                    storage.get('model'),
+                    storage.get('serial_number'),
+                    storage.get('size'),
+                    storage.get('device_type'),
+                    storage.get('firmware_revision'),
+                    storage.get('temperature')
                 ))
             
+            # 7. Insert motherboard if available
+            if data['motherboard']:
+                # Delete existing motherboard records for this system first
+                cursor.execute("DELETE FROM motherboard WHERE system_id = %s", (system_id,))
+                
+                mb = data['motherboard']
+                cursor.execute("""
+                    INSERT INTO motherboard (system_id, usb_controllers, pci_devices, rtc_present)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    system_id,
+                    mb.get('usb_controllers'),
+                    mb.get('pci_devices'),
+                    mb.get('rtc_presence')
+                ))
+            
+            # 8. Insert individual test results
+            if data['test_results']:
+                # Clear existing test results for this system
+                cursor.execute("DELETE FROM test_results WHERE system_id = %s", (system_id,))
+                
+                for test in data['test_results']:
+                    test_passed = test.get('status') == 'PASSED' or test.get('result') == 'PASSED'
+                    test_name = test.get('test_name') or f"{test.get('component', 'UNKNOWN')} - {test.get('test_name', 'UNKNOWN')}"
+                    
+                    cursor.execute("""
+                        INSERT INTO test_results (system_id, test_name, result, passed)
+                        VALUES (%s, %s, %s, %s)
+                    """, (
+                        system_id,
+                        test_name,
+                        test.get('status') or test.get('result', 'UNKNOWN'),
+                        test_passed
+                    ))
+            
             self.conn.commit()
-            logger.info(f"Successfully uploaded data for device {device_id}, log_test_id: {log_test_id}")
-            return log_test_id
+            logger.info(f"Successfully uploaded data for device {data['serial_number']}, system_id: {system_id}")
+            return system_id
             
         except Exception as e:
             self.conn.rollback()
@@ -516,49 +823,49 @@ class DiagnosticLogParser:
         finally:
             cursor.close()
 
-    #batch processing of log files in a folder
-    def process_log_folder(self, folder_path, employee_number=None, file_pattern="*.log"):
+    #batch processing of JSON files in a folder
+    def process_json_folder(self, folder_path, employee_number=None, file_pattern="*.json"):
         if not os.path.exists(folder_path):
             raise FileNotFoundError(f"Folder not found: {folder_path}")
         
-        # Find all log files matching the pattern
-        log_files = glob.glob(os.path.join(folder_path, file_pattern))
+        # Find all JSON files matching the pattern
+        json_files = glob.glob(os.path.join(folder_path, file_pattern))
         
-        if not log_files:
-            logger.warning(f"No log files found in {folder_path} matching pattern {file_pattern}")
+        if not json_files:
+            logger.warning(f"No JSON files found in {folder_path} matching pattern {file_pattern}")
             return []
         
-        logger.info(f"Found {len(log_files)} log files to process")
+        logger.info(f"Found {len(json_files)} JSON files to process")
         
         results = []
         successful_uploads = 0
         failed_uploads = 0
         
-        for log_file in log_files:
+        for json_file in json_files:
             try:
-                logger.info(f"Processing file: {os.path.basename(log_file)}")
+                logger.info(f"Processing file: {os.path.basename(json_file)}")
                 
-                # Parse the log file
-                data = self.parse_log_file(log_file)
+                # Parse the JSON file
+                data = self.parse_json_file(json_file)
                 
                 # Upload to database
-                log_test_id = self.upload_to_database(data, employee_number)
+                system_id = self.upload_to_database(data, employee_number)
                 
                 results.append({
-                    'file': os.path.basename(log_file),
+                    'file': os.path.basename(json_file),
                     'status': 'success',
-                    'log_test_id': log_test_id,
+                    'system_id': system_id,
                     'serial_number': data.get('serial_number', 'Unknown')
                 })
                 successful_uploads += 1
                 
             except Exception as e:
-                logger.error(f"Failed to process {os.path.basename(log_file)}: {e}")
+                logger.error(f"Failed to process {os.path.basename(json_file)}: {e}")
                 results.append({
-                    'file': os.path.basename(log_file),
+                    'file': os.path.basename(json_file),
                     'status': 'failed',
                     'error': str(e),
-                    'log_test_id': None,
+                    'system_id': None,
                     'serial_number': 'Unknown'
                 })
                 failed_uploads += 1
@@ -579,6 +886,16 @@ class DiagnosticLogParser:
         }
         
         if output_file:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            reports_dir = os.path.join(script_dir, "Reports")
+            
+            if not os.path.exists(reports_dir):
+                os.makedirs(reports_dir)
+                logger.info(f"Created Reports directory: {reports_dir}")
+            
+            if not os.path.dirname(output_file):
+                output_file = os.path.join(reports_dir, output_file)
+            
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=2)
             logger.info(f"Batch report saved to: {output_file}")
@@ -594,16 +911,19 @@ def main():
         # Connect to database
         parser.connect_db()
         
-        # BATCH PROCESSING - Process entire folder
-        folder_path = r"D:\\Log"
+        # BATCH PROCESSING - Process entire folder with JSON files
+        # folder_path = r"c:\Users\eduardo.beltran\Documents\Lenovo\self test log upload"
+        folder_path = r"D:\Log"
         employee_number = '21883'
         
-        logger.info(f"Starting batch processing of folder: {folder_path}")
+        logger.info(f"Starting batch processing of JSON files in folder: {folder_path}")
         
-        #process the log files in the folder
-        results = parser.process_log_folder(folder_path, employee_number, "*.log")
-        report = parser.generate_batch_report(results, 'batch_processing_report.json')
-        
+        #process the JSON files in the folder
+        results = parser.process_json_folder(folder_path, employee_number, "*.json")
+        #adds today date and the report name
+        today = datetime.now().strftime("%Y%m%d")
+        report = parser.generate_batch_report(results, f'processed_report_{today}.json')
+
         #Summary of the processed files
         print(f"\n=== BATCH PROCESSING SUMMARY ===")
         print(f"Total files: {report['summary']['total_files']}")
