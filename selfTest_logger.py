@@ -10,6 +10,29 @@ import glob
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def load_db_config(config_file_path='dataBaseInfo.config'):
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, config_file_path)
+    
+        with open(config_path, 'r') as config_file:
+            config_content = config_file.read()
+
+        config_namespace = {}
+        exec(config_content, config_namespace)
+        
+        return config_namespace['db_config']
+    
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {config_path}")
+        raise
+    except KeyError:
+        logger.error(f"db_config not found in config file: {config_path}")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading config file: {e}")
+        raise
+
 class DiagnosticLogParser:
     def __init__(self, db_config):
         self.db_config = db_config
@@ -563,12 +586,11 @@ class DiagnosticLogParser:
         return report
 
 def main():
-    #Database configuration
-    
-    # Initialize parser
-    parser = DiagnosticLogParser(db_config)
-    
     try:
+        # Load database configuration from config file
+        db_config = load_db_config()
+        parser = DiagnosticLogParser(db_config)
+        
         # Connect to database
         parser.connect_db()
         
@@ -597,7 +619,8 @@ def main():
     except Exception as e:
         logger.error(f"Batch process failed: {e}")
     finally:
-        parser.close_db()
+        if 'parser' in locals():
+            parser.close_db()
 
 if __name__ == "__main__":
     main()
