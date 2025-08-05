@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Log Database Uploader - Combines log parsing with database upload functionality
-Based on selfTest_logger.py but adapted for .log files instead of .json files
-"""
-
 import re
 import os
 import psycopg2
@@ -15,7 +9,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_db_config(config_file_path='dataBaseInfo.config'):
-    """Load database configuration from config file"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, config_file_path)
@@ -39,11 +32,6 @@ def load_db_config(config_file_path='dataBaseInfo.config'):
         raise
 
 class LenovoLogDatabaseUploader:
-    """
-    Complete Lenovo diagnostic log parser and database uploader
-    Handles parsing .log files and uploading to PostgreSQL database
-    Based on selfTest_logger.py architecture but adapted for log files
-    """
     
     def __init__(self, db_config=None):
         self.log_content = None
@@ -67,16 +55,25 @@ class LenovoLogDatabaseUploader:
             logger.info("Database connection closed")
     
     def validate_battery(self, health_percentage, cycles):
-        """Validate battery based on Lenovo standards"""
-        if health_percentage is None or cycles is None:
+        """Validate battery based on strict Lenovo standards - both health and cycles must pass"""
+        if health_percentage is None:
             return {'status': 'UNKNOWN', 'message': 'Insufficient data for validation'}
         
-        if health_percentage >= 80 and cycles <= 500:
-            return {'status': 'GOOD', 'message': 'Battery health is within acceptable range'}
-        elif health_percentage >= 70 and cycles <= 800:
-            return {'status': 'FAIR', 'message': 'Battery health is fair, consider replacement soon'}
-        else:
-            return {'status': 'POOR', 'message': 'Battery health is poor, replacement recommended'}
+        # Check health percentage (must be >= 80%)
+        health_passed = health_percentage >= 80
+        
+        # Check cycle count (must be < 750 cycles)
+        cycles_passed = cycles is not None and cycles < 750
+        
+        # Both conditions must pass for GOOD status
+        if health_passed and cycles_passed:
+            return {'status': 'GOOD', 'message': f'Battery health is good ({health_percentage:.1f}%, {cycles} cycles)'}
+        elif not health_passed and not cycles_passed:
+            return {'status': 'FAILED', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%) and cycles too high ({cycles})'}
+        elif not health_passed:
+            return {'status': 'FAILED', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%)'}
+        else:  # not cycles_passed
+            return {'status': 'FAILED', 'message': f'Battery failed: cycle count too high ({cycles} cycles)'}
     
     def extract_field_value(self, line):
         """Extract value from a line in format 'FIELD_NAME: value'"""
@@ -89,19 +86,46 @@ class LenovoLogDatabaseUploader:
         self.filename = os.path.basename(file_path)
         self._file_path = file_path  # Store full path for JSON companion file lookup
         
-        try:
-            # First try UTF-16 (which seems to be the actual encoding)
+        # List of encodings to try in order
+        encodings_to_try = [
+            'utf-16',
+            'utf-16-le', 
+            'utf-16-be',
+            'utf-8',
+            'utf-8-sig',  # UTF-8 with BOM
+            'latin-1',
+            'cp1252'
+        ]
+        
+        for encoding in encodings_to_try:
             try:
-                with open(file_path, 'r', encoding='utf-16') as f:
+                with open(file_path, 'r', encoding=encoding) as f:
                     self.log_content = f.read()
-            except UnicodeDecodeError:
-                # Fallback to UTF-8 with error handling
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    self.log_content = f.read()
+                logger.info(f"Successfully loaded log file: {self.filename} (encoding: {encoding})")
+                return True
+            except (UnicodeDecodeError, UnicodeError) as e:
+                logger.debug(f"Failed to read {self.filename} with {encoding}: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error reading {self.filename} with {encoding}: {e}")
+                continue
+        
+        # If all encodings fail, try reading as binary and decode with error handling
+        try:
+            with open(file_path, 'rb') as f:
+                raw_data = f.read()
             
-            logger.info(f"Successfully loaded log file: {self.filename}")
-            return True
-            
+            # Try to decode with UTF-8 and replace/ignore errors
+            try:
+                self.log_content = raw_data.decode('utf-8', errors='replace')
+                logger.warning(f"Loaded {self.filename} with UTF-8 and error replacement")
+                return True
+            except Exception:
+                # Last resort: try latin-1 which can decode any byte sequence
+                self.log_content = raw_data.decode('latin-1', errors='replace')
+                logger.warning(f"Loaded {self.filename} with latin-1 fallback")
+                return True
+                
         except Exception as e:
             logger.error(f"Error loading {self.filename}: {e}")
             return False
@@ -525,12 +549,55 @@ class LenovoLogDatabaseUploader:
         lines = self.log_content.split('\n')
         system_data = {}
         
-        # Parse header information (first 20 lines) and also look for 8S_CODE
-        for line in lines[:20]:  # Extend search to first 20 lines
+        # Extract machine serial number from filename first (e.g., PF4CC0SB-2025-07-30-115447.log)
+        machine_serial_from_filename = None
+        if self.filename:
+            # Extract exactly the first 8 characters before the first hyphen as the machine serial
+            filename_parts = self.filename.split('-')
+            if len(filename_parts) > 0:
+                potential_serial = filename_parts[0]
+                # Take exactly 8 characters for machine serial (standard Lenovo format)
+                if len(potential_serial) >= 8 and potential_serial.isalnum():
+                    machine_serial_from_filename = potential_serial[:8]  # Take first 8 characters
+                elif len(potential_serial) >= 6 and potential_serial.isalnum():
+                    # Fallback for shorter serials, but prefer 8-character format
+                    machine_serial_from_filename = potential_serial
+        
+        # Also check for SYSTEM_SERIAL_NUMBER or MACHINE_SERIAL_NUMBER in the log content (as backup)
+        machine_serial_from_log = None
+        for line in lines[:30]:  # Check first 30 lines
             line = line.strip()
-            if line.startswith('SERIAL_NUMBER:'):
-                system_data['machine_serial_number'] = self.extract_field_value(line)
-            elif line.startswith('BIOS_VERSION:'):
+            if (line.startswith('SYSTEM_SERIAL_NUMBER:') or 
+                line.startswith('MACHINE_SERIAL_NUMBER:') or
+                line.startswith('COMPUTER_SERIAL_NUMBER:')):
+                potential_serial = self.extract_field_value(line)
+                # Validate it's a proper machine serial (6+ chars, alphanumeric)
+                if len(potential_serial) >= 6 and potential_serial.isalnum():
+                    machine_serial_from_log = potential_serial
+                    break
+        
+        # PRIORITIZE FILENAME - use filename as primary source, log content as backup only
+        if machine_serial_from_filename:
+            system_data['machine_serial_number'] = machine_serial_from_filename
+            logger.debug(f"Using machine serial from filename: {machine_serial_from_filename}")
+        elif machine_serial_from_log:
+            system_data['machine_serial_number'] = machine_serial_from_log
+            logger.debug(f"Using machine serial from log content (filename failed): {machine_serial_from_log}")
+        else:
+            # Last resort: use filename without validation
+            if self.filename and '-' in self.filename:
+                fallback_serial = self.filename.split('-')[0]
+                system_data['machine_serial_number'] = fallback_serial
+                logger.warning(f"Using fallback machine serial from filename: {fallback_serial}")
+            else:
+                system_data['machine_serial_number'] = 'Unknown'
+                logger.warning(f"Could not determine machine serial for file: {self.filename}")
+        
+        # Parse header information (first 30 lines) for other system details
+        for line in lines[:30]:  # Extend search to first 30 lines
+            line = line.strip()
+            # Skip component serial numbers
+            if line.startswith('BIOS_VERSION:'):
                 system_data['bios_version'] = self.extract_field_value(line)
             elif line.startswith('MACHINE_MODEL:'):
                 system_data['machine_model'] = self.extract_field_value(line)
@@ -540,7 +607,7 @@ class LenovoLogDatabaseUploader:
                 system_data['execution_type'] = self.extract_field_value(line)
         
         # Search entire log for 8S_CODE which contains machine type
-        machine_type_model = 'Unknown'
+        machine_type_model = 'N/A'
         
         # First, try to get machine type from companion JSON file if it exists
         json_file_path = self.filename.replace('.log', '.json')
@@ -552,43 +619,49 @@ class LenovoLogDatabaseUploader:
                 import json
                 with open(full_json_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
-                    machine_type_model = json_data.get('machine_type_model', 'Unknown')
+                    machine_type_model = json_data.get('machine_type_model', 'N/A')
             except Exception:
-                pass  # Fall back to 8S_CODE extraction
+                pass  # Keep N/A if JSON extraction fails
+            #If no JSON file found, keep machine_type_model as 'N/A'
         
-        # If no JSON file or extraction failed, fall back to 8S_CODE extraction
-        if machine_type_model == 'Unknown':
-            for line in lines:
-                if line.startswith('8S_CODE:'):
-                    eight_s_code = self.extract_field_value(line)
-                    # Extract machine type from 8S_CODE (usually first 4 characters after "8SS")
-                    if eight_s_code and len(eight_s_code) > 6:
-                        if eight_s_code.startswith('8SSB'):
-                            machine_type_model = eight_s_code[4:8]  # Extract "21K8" from "8SSB21K86206L1HF337001G"
-                        elif eight_s_code.startswith('8SS'):
-                            machine_type_model = eight_s_code[3:7]
-                        else:
-                            machine_type_model = eight_s_code[:4]
-                    break
-        
-        # Extract timestamps from the log
+        # Extract timestamps from the log with proper parsing
         start_time = None
         finish_time = None
+        start_timestamp = None
+        finish_timestamp = None
+        elapsed_seconds = None
+        test_date = None
         
+        # Find start time (first timestamp in log)
         for line in lines:
             if '+++ ' in line and 'UTC' in line:
-                # Extract timestamp from "+++ 20250729T105545UTC"
                 match = re.search(r'(\d{8}T\d{6})UTC', line)
                 if match and start_time is None:
                     start_time = match.group(1)
-            elif '--- ' in line and finish_time is None:
-                # Find the last timestamp in the log
-                for reverse_line in reversed(lines):
-                    match = re.search(r'(\d{8}T\d{6})UTC', reverse_line)
-                    if match:
-                        finish_time = match.group(1)
-                        break
+                    try:
+                        from datetime import datetime
+                        start_timestamp = datetime.strptime(start_time, '%Y%m%dT%H%M%S')
+                        test_date = start_timestamp.date()
+                    except:
+                        pass
+                    break
+        
+        # Find finish time (last timestamp in log) 
+        for reverse_line in reversed(lines):
+            match = re.search(r'(\d{8}T\d{6})UTC', reverse_line)
+            if match:
+                finish_time = match.group(1)
+                # Parse to proper datetime for database
+                try:
+                    from datetime import datetime
+                    finish_timestamp = datetime.strptime(finish_time, '%Y%m%dT%H%M%S')
+                except:
+                    pass
                 break
+        
+        #Calculate elapsed time in seconds
+        if start_timestamp and finish_timestamp:
+            elapsed_seconds = int((finish_timestamp - start_timestamp).total_seconds())
         
         return {
             'machine_serial_number': system_data.get('machine_serial_number', 'Unknown'),
@@ -598,11 +671,14 @@ class LenovoLogDatabaseUploader:
             'application_version': system_data.get('application_version', 'Unknown'),
             'execution_type': system_data.get('execution_type', 'Unknown'),
             'start_time': start_time or 'Unknown',
-            'finish_time': finish_time or 'Unknown'
+            'finish_time': finish_time or 'Unknown',
+            'test_start_timestamp': start_timestamp,
+            'test_finish_timestamp': finish_timestamp,
+            'test_elapsed_seconds': elapsed_seconds,
+            'test_date': test_date
         }
     
     def parse_all_data(self):
-        """Parse all diagnostic data from the loaded log file"""
         if not self.log_content:
             return None
         
@@ -618,7 +694,6 @@ class LenovoLogDatabaseUploader:
         }
     
     def upload_to_database(self, data=None):
-        """Upload parsed log data to PostgreSQL database (similar to selfTest_logger.py)"""
         if not self.conn:
             raise Exception("Database connection not established. Call connect_db() first.")
         
@@ -632,16 +707,13 @@ class LenovoLogDatabaseUploader:
         cursor = self.conn.cursor()
         
         try:
-            # 1. Insert/Update system_info (main table) - Using DELETE/INSERT pattern like fixed selfTest_logger
+            # 1. Insert system_info (main table) - Allow multiple test records per machine
             system_info = data['system_info']
             
+            # Direct INSERT without DELETE - allows multiple test sessions per machine
             cursor.execute("""
-                DELETE FROM system_info WHERE serial_number = %s
-            """, (system_info['machine_serial_number'],))
-            
-            cursor.execute("""
-                INSERT INTO system_info (serial_number, machine_model, machine_type_model, bios_version, app_version, execution_type, start_time, finish_time) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+                INSERT INTO system_info (serial_number, machine_model, machine_type_model, bios_version, app_version, execution_type, start_time, finish_time, created_at) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) 
                 RETURNING id
             """, (
                 system_info['machine_serial_number'],
@@ -651,16 +723,26 @@ class LenovoLogDatabaseUploader:
                 system_info['application_version'],
                 system_info['execution_type'],
                 system_info.get('start_time'),
-                system_info.get('finish_time')
+                system_info.get('finish_time'),
+                system_info.get('test_start_timestamp') or datetime.now()  # Use test start time as created_at, fallback to now
             ))
             
             system_id = cursor.fetchone()[0]
-            logger.info(f"System info inserted/updated with ID: {system_id}")
+            
+            # Log timing information
+            if system_info.get('test_start_timestamp') and system_info.get('test_finish_timestamp'):
+                elapsed_time = system_info.get('test_elapsed_seconds', 0)
+                elapsed_mins = elapsed_time // 60
+                elapsed_secs = elapsed_time % 60
+                logger.info(f"Test timing - Start: {system_info['test_start_timestamp']}, "
+                           f"Finish: {system_info['test_finish_timestamp']}, "
+                           f"Duration: {elapsed_mins}m {elapsed_secs}s")
+            
+            logger.info(f"System info inserted with ID: {system_id}")
             
             # 2. Insert battery if available
             if data['battery']:
                 battery = data['battery']
-                cursor.execute("DELETE FROM battery WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO battery (system_id, serial_number, manufacturer, design_capacity, full_charge_capacity, cycles, health_percentage, validation_status, validation_message)
@@ -684,7 +766,6 @@ class LenovoLogDatabaseUploader:
             # 3. Insert display if available
             if data['display']:
                 display = data['display']
-                cursor.execute("DELETE FROM display WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO display (system_id, name, manufacturer_id, width, height, edid_version)
@@ -701,7 +782,6 @@ class LenovoLogDatabaseUploader:
             # 4. Insert CPU if available
             if data['cpu']:
                 cpu = data['cpu']
-                cursor.execute("DELETE FROM cpu WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO cpu (system_id, model, manufacturer, cores, threads, current_speed, cache_l1, cache_l2, cache_l3)
@@ -721,7 +801,6 @@ class LenovoLogDatabaseUploader:
             # 5. Insert memory if available
             if data['memory']:
                 memory = data['memory']
-                cursor.execute("DELETE FROM memory WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO memory (system_id, total_memory, module_count, module_type, module_manufacturer, module_size, module_speed, module_part_number)
@@ -740,7 +819,6 @@ class LenovoLogDatabaseUploader:
             # 6. Insert storage if available
             if data['storage']:
                 storage = data['storage']
-                cursor.execute("DELETE FROM storage WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO storage (system_id, model, serial_number, size, protocol, firmware, temperature)
@@ -758,7 +836,6 @@ class LenovoLogDatabaseUploader:
             # 7. Insert motherboard if available
             if data['motherboard']:
                 mb = data['motherboard']
-                cursor.execute("DELETE FROM motherboard WHERE system_id = %s", (system_id,))
                 
                 cursor.execute("""
                     INSERT INTO motherboard (system_id, usb_controllers, pci_devices, rtc_present)
@@ -772,23 +849,31 @@ class LenovoLogDatabaseUploader:
             
             # 8. Insert test results if available
             if data['test_results'] and data['test_results']['tests']:
-                cursor.execute("DELETE FROM test_results WHERE system_id = %s", (system_id,))
+                
+                # Get timing data from system_info for all test results
+                test_start_time = system_info.get('test_start_timestamp')
+                test_finish_time = system_info.get('test_finish_timestamp')
+                test_elapsed_seconds = system_info.get('test_elapsed_seconds')
+                test_date = system_info.get('test_date')
                 
                 for test in data['test_results']['tests']:
                     cursor.execute("""
-                        INSERT INTO test_results (system_id, test_name, result, passed)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO test_results (system_id, test_name, result, passed, test_start_time, test_finish_time, test_elapsed_seconds, test_date)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         system_id,
                         test['test_name'],
                         test['result'],
-                        test['passed']
+                        test['passed'],
+                        test_start_time,
+                        test_finish_time,
+                        test_elapsed_seconds,
+                        test_date
                     ))
                 
-                logger.info(f"Inserted {len(data['test_results']['tests'])} test results")
+                logger.info(f"Inserted {len(data['test_results']['tests'])} test results with timing data")
             
             self.conn.commit()
-            logger.info(f"Successfully uploaded data for device {system_info['machine_serial_number']}, system_id: {system_id}")
             return system_id
             
         except Exception as e:
@@ -812,15 +897,25 @@ class LenovoLogDatabaseUploader:
                 logger.error(f"Failed to parse data from: {file_path}")
                 return None
             
+            # Validate that we have at least system info
+            if not data.get('system_info') or not data['system_info'].get('machine_serial_number'):
+                logger.error(f"No valid system info found in: {file_path}")
+                return None
+            
             # Upload to database
             system_id = self.upload_to_database(data)
             
-            logger.info(f"Successfully processed and uploaded {self.filename} with system_id: {system_id}")
-            return system_id
+            if system_id:
+                logger.info(f"Successfully processed and uploaded {self.filename} with system_id: {system_id}")
+                return system_id
+            else:
+                logger.error(f"Failed to upload data for {self.filename}")
+                return None
             
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
-            raise
+            # Don't re-raise, just return None to continue with other files
+            return None
     
     def process_log_directory(self, log_directory, pattern="*.log"):
         """Process all log files in a directory and upload to database"""
@@ -838,10 +933,22 @@ class LenovoLogDatabaseUploader:
             logger.warning(f"No log files found in {log_directory}")
             return []
         
-        logger.info(f"Found {len(log_files)} log file(s) to process")
+        # Filter out obviously invalid files
+        valid_log_files = []
+        for log_file in log_files:
+            filename = os.path.basename(log_file)
+            # Skip files that don't look like proper diagnostic logs
+            if (filename.lower() == 'log.log' or 
+                len(filename) < 10 or 
+                not filename.endswith('.log')):
+                logger.warning(f"Skipping invalid file: {filename}")
+                continue
+            valid_log_files.append(log_file)
+        
+        logger.info(f"Found {len(valid_log_files)} valid log file(s) to process (skipped {len(log_files) - len(valid_log_files)} invalid files)")
         
         results = []
-        for log_file in log_files:
+        for log_file in valid_log_files:
             try:
                 system_id = self.process_and_upload_log_file(log_file)
                 if system_id:
@@ -887,11 +994,7 @@ def main():
         
         # Process all log files in directory
         results = uploader.process_log_directory(log_path)
-        
-        # Print summary
-        print(f"\n{'='*80}")
-        print("UPLOAD SUMMARY")
-        print(f"{'='*80}")
+
         
         for result in results:
             status_icon = "✅" if result['status'] == 'success' else "❌"
