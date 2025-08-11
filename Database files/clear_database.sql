@@ -1,11 +1,4 @@
--- Clear Database Script
--- This script will remove ALL data from the Lenovo diagnostics database
--- Use this to test the updated battery validation and serial number extraction
 
--- WARNING: This will delete ALL data in the database!
--- Make sure you have backups if needed before running this script
-
--- Delete all data from child tables first (due to foreign key constraints)
 DELETE FROM test_results;
 DELETE FROM motherboard;
 DELETE FROM storage;

@@ -65,15 +65,16 @@ class LenovoLogDatabaseUploader:
         # Check cycle count (must be < 750 cycles)
         cycles_passed = cycles is not None and cycles < 750
         
-        # Both conditions must pass for GOOD status
+        # Determine status based on both conditions
         if health_passed and cycles_passed:
             return {'status': 'GOOD', 'message': f'Battery health is good ({health_percentage:.1f}%, {cycles} cycles)'}
         elif not health_passed and not cycles_passed:
-            return {'status': 'FAILED', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%) and cycles too high ({cycles})'}
+            return {'status': 'POOR', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%) and cycles too high ({cycles})'}
         elif not health_passed:
-            return {'status': 'FAILED', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%)'}
+            return {'status': 'POOR', 'message': f'Battery failed: health below 80% ({health_percentage:.1f}%)'}
         else:  # not cycles_passed
-            return {'status': 'FAILED', 'message': f'Battery failed: cycle count too high ({cycles} cycles)'}
+            return {'status': 'FAIR', 'message': f'Battery degraded: cycle count too high ({cycles} cycles)'}
+    
     
     def extract_field_value(self, line):
         """Extract value from a line in format 'FIELD_NAME: value'"""
@@ -504,8 +505,8 @@ class LenovoLogDatabaseUploader:
                     current_section = parts[2]  # BATTERY, DISPLAY, etc.
             
             # Parse test results
-            if 'STOP ' in line and ('PASSED' in line or 'FAILED' in line or 'NOT APPLICABLE' in line):
-                # Example: "20250729T105545UTC STOP HEALTH_TEST PASSED 0 S"
+            if 'STOP ' in line and ('PASSED' in line or 'FAILED' in line or 'NOT APPLICABLE' in line or 'SUCCESS' in line):
+                # Example: "20250729T105545UTC STOP HEALTH_TEST PASSED 0 S" or "20250807T202117UTC STOP INTERNAL_SPEAKER_TEST SUCCESS 15 S"
                 parts = line.split()
                 if len(parts) >= 4:
                     test_name_part = None
@@ -515,14 +516,14 @@ class LenovoLogDatabaseUploader:
                     for i, part in enumerate(parts):
                         if part == 'STOP' and i + 1 < len(parts):
                             test_name_part = parts[i + 1]
-                        elif part in ['PASSED', 'FAILED', 'NOT APPLICABLE']:
+                        elif part in ['PASSED', 'FAILED', 'NOT APPLICABLE', 'SUCCESS']:
                             result_part = part
                             break
                     
                     if test_name_part and result_part:
                         test_name = f"{current_section} - {test_name_part}" if current_section else test_name_part
                         result = result_part
-                        passed = result == 'PASSED'
+                        passed = result in ['PASSED', 'SUCCESS']
                         
                         test_results.append({
                             'test_name': test_name,
@@ -533,6 +534,48 @@ class LenovoLogDatabaseUploader:
                         total_tests += 1
                         if passed:
                             passed_tests += 1
+        
+        # Add battery validation tests based on battery health analysis
+        battery_data = self.parse_battery()
+        if battery_data and battery_data.get('health_percentage') is not None:
+            # Create battery health test based on validation
+            validation_status = battery_data.get('validation_status', 'UNKNOWN')
+            
+            # Overall battery health test
+            battery_health_passed = validation_status == 'GOOD'
+            test_results.append({
+                'test_name': 'BATTERY - HEALTH_TEST',
+                'result': 'PASSED' if battery_health_passed else 'FAILED',
+                'passed': battery_health_passed
+            })
+            total_tests += 1
+            if battery_health_passed:
+                passed_tests += 1
+            
+            # Specific health percentage test
+            health_percentage = battery_data.get('health_percentage', 0)
+            health_percentage_passed = health_percentage >= 80
+            test_results.append({
+                'test_name': 'BATTERY - HEALTH_PERCENTAGE_TEST',
+                'result': 'PASSED' if health_percentage_passed else 'FAILED',
+                'passed': health_percentage_passed
+            })
+            total_tests += 1
+            if health_percentage_passed:
+                passed_tests += 1
+            
+            # Battery cycle count test
+            cycles = battery_data.get('cycles', 0)
+            if cycles is not None:
+                cycles_passed = cycles < 750
+                test_results.append({
+                    'test_name': 'BATTERY - CYCLE_COUNT_TEST',
+                    'result': 'PASSED' if cycles_passed else 'FAILED',
+                    'passed': cycles_passed
+                })
+                total_tests += 1
+                if cycles_passed:
+                    passed_tests += 1
         
         return {
             'tests': test_results,
