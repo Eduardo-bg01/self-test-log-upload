@@ -102,7 +102,6 @@ class LenovoLogDatabaseUploader:
             try:
                 with open(file_path, 'r', encoding=encoding) as f:
                     self.log_content = f.read()
-                logger.info(f"Successfully loaded log file: {self.filename} (encoding: {encoding})")
                 return True
             except (UnicodeDecodeError, UnicodeError) as e:
                 logger.debug(f"Failed to read {self.filename} with {encoding}: {e}")
@@ -680,26 +679,30 @@ class LenovoLogDatabaseUploader:
             if '+++ ' in line and 'UTC' in line:
                 match = re.search(r'(\d{8}T\d{6})UTC', line)
                 if match and start_time is None:
-                    start_time = match.group(1)
+                    raw_start_time = match.group(1)
                     try:
                         from datetime import datetime
-                        start_timestamp = datetime.strptime(start_time, '%Y%m%dT%H%M%S')
+                        start_timestamp = datetime.strptime(raw_start_time, '%Y%m%dT%H%M%S')
+                        # Format as "day/month/year hour:minutes" (e.g., "07/08/2025 20:34")
+                        start_time = start_timestamp.strftime('%d/%m/%Y %H:%M')
                         test_date = start_timestamp.date()
                     except:
-                        pass
+                        start_time = raw_start_time  # Fallback to original format
                     break
         
         # Find finish time (last timestamp in log) 
         for reverse_line in reversed(lines):
             match = re.search(r'(\d{8}T\d{6})UTC', reverse_line)
             if match:
-                finish_time = match.group(1)
+                raw_finish_time = match.group(1)
                 # Parse to proper datetime for database
                 try:
                     from datetime import datetime
-                    finish_timestamp = datetime.strptime(finish_time, '%Y%m%dT%H%M%S')
+                    finish_timestamp = datetime.strptime(raw_finish_time, '%Y%m%dT%H%M%S')
+                    # Format as "day/month/year hour:minutes" (e.g., "07/08/2025 20:34")
+                    finish_time = finish_timestamp.strftime('%d/%m/%Y %H:%M')
                 except:
-                    pass
+                    finish_time = raw_finish_time  # Fallback to original format
                 break
         
         #Calculate elapsed time in seconds
@@ -767,7 +770,7 @@ class LenovoLogDatabaseUploader:
                 system_info['execution_type'],
                 system_info.get('start_time'),
                 system_info.get('finish_time'),
-                system_info.get('test_start_timestamp') or datetime.now()  # Use test start time as created_at, fallback to now
+                system_info.get('test_start_timestamp') or datetime.now()
             ))
             
             system_id = cursor.fetchone()[0]
@@ -777,11 +780,7 @@ class LenovoLogDatabaseUploader:
                 elapsed_time = system_info.get('test_elapsed_seconds', 0)
                 elapsed_mins = elapsed_time // 60
                 elapsed_secs = elapsed_time % 60
-                logger.info(f"Test timing - Start: {system_info['test_start_timestamp']}, "
-                           f"Finish: {system_info['test_finish_timestamp']}, "
-                           f"Duration: {elapsed_mins}m {elapsed_secs}s")
-            
-            logger.info(f"System info inserted with ID: {system_id}")
+                logger.info(f"\nTest Duration: {elapsed_mins}m {elapsed_secs}s")
             
             # 2. Insert battery if available
             if data['battery']:
@@ -913,8 +912,6 @@ class LenovoLogDatabaseUploader:
                         test_elapsed_seconds,
                         test_date
                     ))
-                
-                logger.info(f"Inserted {len(data['test_results']['tests'])} test results with timing data")
             
             self.conn.commit()
             return system_id
@@ -927,20 +924,16 @@ class LenovoLogDatabaseUploader:
             cursor.close()
     
     def process_and_upload_log_file(self, file_path):
-        """Complete workflow: load log file, parse data, and upload to database"""
         try:
-            # Load the log file
             if not self.load_log_file(file_path):
                 logger.error(f"Failed to load log file: {file_path}")
                 return None
             
-            # Parse all data
             data = self.parse_all_data()
             if not data:
                 logger.error(f"Failed to parse data from: {file_path}")
                 return None
-            
-            # Validate that we have at least system info
+                
             if not data.get('system_info') or not data['system_info'].get('machine_serial_number'):
                 logger.error(f"No valid system info found in: {file_path}")
                 return None
@@ -957,11 +950,9 @@ class LenovoLogDatabaseUploader:
             
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
-            # Don't re-raise, just return None to continue with other files
             return None
     
     def process_log_directory(self, log_directory, pattern="*.log"):
-        """Process all log files in a directory and upload to database"""
         import glob
         
         if not os.path.exists(log_directory):
