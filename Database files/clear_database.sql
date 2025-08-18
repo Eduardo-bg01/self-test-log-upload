@@ -40,3 +40,5 @@ SELECT 'test_results' as table_name, COUNT(*) as row_count FROM test_results;
 
 -- Show message
 SELECT 'Database cleared successfully! All tables are now empty.' as status;
+
+

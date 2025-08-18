@@ -93,7 +93,7 @@ class LenovoLogDatabaseUploader:
             'utf-16-le', 
             'utf-16-be',
             'utf-8',
-            'utf-8-sig',  # UTF-8 with BOM
+            'utf-8-sig',
             'latin-1',
             'cp1252'
         ]
@@ -912,7 +912,7 @@ class LenovoLogDatabaseUploader:
                         test_elapsed_seconds,
                         test_date
                     ))
-            
+                
             self.conn.commit()
             return system_id
             
@@ -1016,17 +1016,13 @@ class LenovoLogDatabaseUploader:
 
 
 def main():
-    """Example usage of the LenovoLogDatabaseUploader"""
     log_path = r"D:\Log"
     
     try:
-        # Create uploader instance
         uploader = LenovoLogDatabaseUploader()
         
-        # Connect to database
         uploader.connect_db()
         
-        # Process all log files in directory
         results = uploader.process_log_directory(log_path)
 
         
